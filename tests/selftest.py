@@ -34,14 +34,15 @@ def check(name: str, cond: bool, detail: str = ""):
         failures.append(name)
 
 
-async def set_cfg(client: httpx.AsyncClient, *, up: float, down: float):
+async def set_cfg(client: httpx.AsyncClient, *, up: float, down: float,
+                  listen_host: str = "0.0.0.0", listen_port: int | None = None):
     r = await client.post("/api/config", json={
-        "listen_host": "0.0.0.0", "listen_port": PROXY_PORT,
+        "listen_host": listen_host, "listen_port": listen_port or PROXY_PORT,
         "target_host": TARGET_HOST, "target_port": int(TARGET_PORT),
         "up_delay_ms": up, "down_delay_ms": down})
     r.raise_for_status()
     d = r.json()
-    assert d["listening"], d
+    assert d["ok"] and d["listening"], d
     return d
 
 
@@ -60,6 +61,21 @@ async def find_conn(client: httpx.AsyncClient, up_bytes: int, retries: int = 30)
                 return c
         await asyncio.sleep(0.2)
     return None
+
+
+async def probe_serving(host: str, port: int, timeout: float = 3.0) -> bool:
+    """该端口是否还在提供代理服务（能建立连接并读到欢迎行）。"""
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+        line = await asyncio.wait_for(reader.readline(), timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return bool(line)
+    except Exception:
+        return False
 
 
 async def main():
@@ -157,6 +173,81 @@ async def main():
                   f"state={rst_conn['state']} error={rst_conn['error']}")
 
         await set_cfg(client, up=300, down=300)  # 恢复默认
+
+        # 6. 监听切换语义
+        base = {"target_host": TARGET_HOST, "target_port": int(TARGET_PORT),
+                "up_delay_ms": 300, "down_delay_ms": 300}
+
+        # 6a. 新监听地址绑定失败：接口明确报错（非 2xx + ok=false），
+        #     原监听与原配置保留，设备上传/试传不中断。
+        #     192.0.2.1 是 TEST-NET-1 保留地址，本机必然无法绑定。
+        for bad in ({"listen_host": "192.0.2.1", "listen_port": PROXY_PORT},      # 与原监听重叠 -> 回退路径
+                    {"listen_host": "192.0.2.1", "listen_port": PROXY_PORT + 50}):  # 不重叠 -> 直接失败路径
+            r = await client.post("/api/config", json={**bad, **base})
+            d = r.json()
+            check(f"bad listen addr {bad['listen_port']} rejected with error status",
+                  r.status_code in (409, 500), f"HTTP {r.status_code} {str(d)[:160]}")
+            check("rejection reports ok=false + error (no false success)",
+                  d.get("ok") is False and bool(d.get("error")), str(d)[:200])
+            d = (await client.get("/api/config")).json()
+            check("original listener+config kept after failed switch",
+                  d["listening"] is True and d["config"]["listen_host"] == "0.0.0.0"
+                  and d["config"]["listen_port"] == PROXY_PORT, str(d)[:200])
+            res = await upload(client, b"kept-listener-" + os.urandom(2048))
+            check("upload still works on kept listener", res.get("ok") is True,
+                  str(res)[:160])
+
+        # 6b. 成功切换端口：在途连接沿用旧快照完成回执，新连接/试传走新监听
+        new_port = PROXY_PORT + 2
+        reader, writer = await asyncio.open_connection(PROXY_HOST, PROXY_PORT)
+        await asyncio.wait_for(reader.readline(), 30)  # 欢迎行 => 连接已建立
+        old_data = b"old-conn-" + os.urandom(4096)
+        writer.write(old_data)
+        await writer.drain()
+        await asyncio.sleep(0.3)  # 让数据进入延迟线
+        r = await client.post("/api/config", json={
+            "listen_host": "0.0.0.0", "listen_port": new_port, **base})
+        d = r.json()
+        check("port switch returns ok", r.status_code == 200 and d.get("ok") is True
+              and d["config"]["listen_port"] == new_port, str(d)[:200])
+        # 在途旧连接：半关闭后应收到完整回执（旧快照，不受切换影响）
+        writer.write_eof()
+        receipt_b = await asyncio.wait_for(reader.read(), 60)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        check("in-flight conn completes on old snapshot",
+              f"bytes={len(old_data)}".encode() in receipt_b,
+              receipt_b.decode(errors="replace")[:120])
+        # 新监听接受新连接
+        check("new port serving", await probe_serving(PROXY_HOST, new_port))
+        # 旧端口不再服务
+        check("old port stopped serving", not await probe_serving(PROXY_HOST, PROXY_PORT))
+        # 切换完成后的试传必须连到当前（新）监听
+        res = await upload(client, b"after-switch-" + os.urandom(2048))
+        check("test-upload uses current (new) listener",
+              res.get("ok") is True and res.get("via", "").endswith(f":{new_port}"),
+              str(res)[:200])
+
+        # 6c. 同端口换监听地址：0.0.0.0 -> 127.0.0.1 -> 0.0.0.0 都应成功
+        r = await client.post("/api/config", json={
+            "listen_host": "127.0.0.1", "listen_port": new_port, **base})
+        d = r.json()
+        check("same-port addr switch 0.0.0.0 -> 127.0.0.1 ok",
+              r.status_code == 200 and d.get("ok") is True, str(d)[:200])
+        res = await upload(client, b"loopback-" + os.urandom(1024))
+        check("upload via 127.0.0.1 listener ok", res.get("ok") is True,
+              str(res)[:160])
+        r = await client.post("/api/config", json={
+            "listen_host": "0.0.0.0", "listen_port": PROXY_PORT, **base})
+        d = r.json()
+        check("switch back to 0.0.0.0:PROXY_PORT ok",
+              r.status_code == 200 and d.get("ok") is True
+              and d["config"]["listen_port"] == PROXY_PORT, str(d)[:200])
+        res = await upload(client, b"restored-" + os.urandom(1024))
+        check("upload ok after restore", res.get("ok") is True, str(res)[:160])
 
     print()
     if failures:

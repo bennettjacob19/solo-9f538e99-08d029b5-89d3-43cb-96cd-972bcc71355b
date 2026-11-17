@@ -8,10 +8,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .engine import DelayProxy, ProxyConfig
+from .engine import DelayProxy, ProxyConfig, self_connect_host
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 UPLOAD_CHUNK = 256 * 1024
@@ -33,7 +33,9 @@ proxy = DelayProxy(_env_config())
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    await proxy.apply_config(proxy.cfg)  # 启动监听器
+    result = await proxy.apply_config(proxy.cfg)  # 启动监听器
+    if not result.ok:
+        print(f"[proxy] initial listen failed: {result.error}", flush=True)
     yield
     await proxy.shutdown()
 
@@ -42,7 +44,7 @@ app = FastAPI(title="TCP Delay Proxy", lifespan=lifespan)
 
 
 class ConfigIn(BaseModel):
-    listen_host: str = "0.0.0.0"
+    listen_host: str = Field(min_length=1)
     listen_port: int = Field(ge=1, le=65535)
     target_host: str = Field(min_length=1)
     target_port: int = Field(ge=1, le=65535)
@@ -63,10 +65,17 @@ async def get_config():
 
 @app.post("/api/config")
 async def set_config(cfg: ConfigIn):
-    await proxy.apply_config(ProxyConfig(**cfg.model_dump()))
+    result = await proxy.apply_config(ProxyConfig(**cfg.model_dump()))
     snap = proxy.snapshot()
-    return {"ok": snap["listening"],
+    body = {"ok": result.ok,
+            "error": result.error,
+            "rolled_back": result.rolled_back,
             **{k: snap[k] for k in ("config", "listening", "listen_error")}}
+    if result.ok:
+        return body
+    # 明确报错：原监听已保留/恢复 -> 409；服务已停止 -> 500。
+    # 即使原监听仍在工作也返回非 2xx，网页不得显示保存成功。
+    return JSONResponse(body, status_code=409 if result.listening else 500)
 
 
 @app.get("/api/connections")
@@ -92,18 +101,23 @@ async def _read_to_eof(reader: asyncio.StreamReader) -> bytes:
 @app.post("/api/test-upload")
 async def test_upload(file: UploadFile):
     """把上传的文件经本代理转发到目标：先读欢迎行，发完文件后半关闭，
-    再读回执直到 EOF。整条路径都经过延迟代理，等同真实设备链路。"""
-    snap = proxy.snapshot()
-    if not snap["listening"]:
-        raise HTTPException(503, f"proxy listener not running: {snap['listen_error']}")
-    cfg = proxy.cfg
+    再读回执直到 EOF。整条路径都经过延迟代理，等同真实设备链路。
+
+    始终连接当前生效的监听地址：切换完成后走新监听；切换窗口内连接
+    被拒绝则明确失败（ok=false），不会把未送达的上传记作成功。"""
+    cfg = proxy.cfg  # 当前生效配置（与实际监听一致；切换完成后即为新监听）
+    if not proxy.listening:
+        raise HTTPException(503, f"proxy listener not running: "
+                                 f"{proxy.listen_error or 'stopped'}")
+    connect_host = self_connect_host(cfg.listen_host)
     delay_s = (cfg.up_delay_ms + cfg.down_delay_ms) / 1000.0
-    result: dict = {"file_name": file.filename, "bytes_sent": 0, "ok": False}
+    result: dict = {"file_name": file.filename, "bytes_sent": 0, "ok": False,
+                    "via": f"{connect_host}:{cfg.listen_port}"}
     writer = None
     t0 = time.monotonic()
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", cfg.listen_port), timeout=15)
+            asyncio.open_connection(connect_host, cfg.listen_port), timeout=15)
         # 目标（示例接收端）先发的欢迎行；自定义目标可能不发，探测失败不阻塞上传
         try:
             welcome = await asyncio.wait_for(reader.readline(),

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import ipaddress
+import socket
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -34,6 +36,60 @@ class ProxyConfig:
     target_port: int = 9000
     up_delay_ms: float = 300.0    # 客户端 -> 目标
     down_delay_ms: float = 300.0  # 目标 -> 客户端
+
+
+@dataclass
+class ApplyResult:
+    """apply_config 的结果：明确区分成功与失败，失败时说明原监听的去向。"""
+    ok: bool
+    listening: bool              # 当前是否在监听
+    error: str | None = None     # 失败原因（面向用户展示）
+    rolled_back: bool = False    # 绑定失败后已回退到原监听
+    restarted: bool = False      # 监听器发生了切换
+
+
+WILDCARD_HOSTS = {"", "0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0"}
+
+
+def _is_wildcard(host: str) -> bool:
+    return (host or "").strip().lower() in WILDCARD_HOSTS
+
+
+def self_connect_host(listen_host: str) -> str:
+    """监听地址是本机通配地址时，本机客户端（如网页试传）应走回环地址。"""
+    h = (listen_host or "").strip()
+    if h.lower() in ("", "0.0.0.0"):
+        return "127.0.0.1"
+    if h.lower() in ("::", "::0", "0:0:0:0:0:0:0:0"):
+        return "::1"
+    return h
+
+
+async def _resolve_host(host: str) -> str:
+    """尽量把监听主机规范化为 IP 字面量（用于重叠判断）；失败则返回原串。"""
+    h = (host or "").strip()
+    if not h or _is_wildcard(h):
+        return h.lower()
+    try:
+        return str(ipaddress.ip_address(h))
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            h, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return h.lower()
+    return infos[0][4][0] if infos else h.lower()
+
+
+async def _listeners_overlap(a: ProxyConfig, b: ProxyConfig) -> bool:
+    """两个监听地址是否无法同时绑定（同端口，且地址相同或任一为通配）。"""
+    if a.listen_port != b.listen_port:
+        return False
+    ha, hb = await _resolve_host(a.listen_host), await _resolve_host(b.listen_host)
+    if ha == hb:
+        return True
+    return _is_wildcard(ha) or _is_wildcard(hb)
 
 
 @dataclass
@@ -233,27 +289,92 @@ class DelayProxy:
     def listening(self) -> bool:
         return self.server is not None and self.server.is_serving()
 
-    async def apply_config(self, new_cfg: ProxyConfig):
-        """应用新配置；仅影响之后建立的连接。监听地址/端口变化时重启监听器。"""
+    async def apply_config(self, new_cfg: ProxyConfig) -> ApplyResult:
+        """应用新配置；仅影响之后建立的连接，已有连接沿用旧快照。
+
+        监听地址/端口变化时的切换语义：
+        * 先在不关闭原监听的情况下试绑新地址——新端口空闲或地址不重叠时
+          零停机切换（如换端口、127.0.0.1 -> 127.0.0.2）；
+        * 若新地址与原监听重叠（如 0.0.0.0:7000 -> 127.0.0.1:7000 同端口
+          换地址），先关闭原监听再绑定；
+        * 绑定失败：保留/恢复原监听与原配置，返回明确错误，不谎报成功；
+        * 回退也失败：停止服务并记录原因（listen_error），接口与网页
+          明确显示停服；之后保存有效配置可恢复。
+        """
         async with self._lock:
             restart = (
                 self.server is None
                 or new_cfg.listen_host != self.cfg.listen_host
                 or new_cfg.listen_port != self.cfg.listen_port
             )
-            self.cfg = dataclasses.replace(new_cfg)
             if not restart:
-                return
-            if self.server is not None:
-                self.server.close()
-                await self.server.wait_closed()
-                self.server = None
-            self.listen_error = None
+                self.cfg = dataclasses.replace(new_cfg)
+                return ApplyResult(ok=True, listening=self.listening)
+
+            old_server = self.server
+            old_cfg = self.cfg
+            new_addr = f"{new_cfg.listen_host}:{new_cfg.listen_port}"
+            old_addr = f"{old_cfg.listen_host}:{old_cfg.listen_port}"
+
+            async def bind(cfg: ProxyConfig) -> asyncio.Server:
+                return await asyncio.start_server(
+                    self._on_client, cfg.listen_host, cfg.listen_port)
+
+            # 1) 原监听不动，直接试绑新地址（不重叠时零停机切换）
+            new_server: asyncio.Server | None = None
+            bind_error: Exception | None = None
             try:
-                self.server = await asyncio.start_server(
-                    self._on_client, new_cfg.listen_host, new_cfg.listen_port)
+                new_server = await bind(new_cfg)
             except Exception as exc:
-                self.listen_error = str(exc)
+                bind_error = exc
+
+            if (new_server is None and old_server is not None
+                    and await _listeners_overlap(old_cfg, new_cfg)):
+                # 2) 新地址可能被自己的原监听占用（同端口换地址）：关原监听重试
+                old_server.close()
+                await old_server.wait_closed()
+                self.server = None
+                old_server = None
+                try:
+                    new_server = await bind(new_cfg)
+                except Exception as exc:
+                    bind_error = exc
+                    # 3) 回退：恢复原监听与原配置
+                    try:
+                        self.server = await bind(old_cfg)
+                    except Exception as rb_exc:
+                        self.listen_error = (
+                            f"切换到 {new_addr} 失败: {bind_error}；"
+                            f"恢复原监听 {old_addr} 也失败: {rb_exc}；服务已停止")
+                        return ApplyResult(ok=False, listening=False,
+                                           error=self.listen_error)
+                    self.listen_error = None
+                    return ApplyResult(
+                        ok=False, listening=True, rolled_back=True,
+                        error=f"新监听地址 {new_addr} 绑定失败: {bind_error}；"
+                              f"已恢复原监听 {old_addr}，配置未变更")
+
+            if new_server is None:
+                # 新地址被他人占用/不可用，且与原监听不冲突：原监听原配置保留
+                if old_server is None:
+                    self.listen_error = (f"监听地址 {new_addr} 绑定失败: "
+                                         f"{bind_error}；服务未启动")
+                    return ApplyResult(ok=False, listening=False,
+                                       error=self.listen_error)
+                return ApplyResult(
+                    ok=False, listening=True,
+                    error=f"新监听地址 {new_addr} 绑定失败: {bind_error}；"
+                          f"原监听 {old_addr} 继续工作，配置未变更")
+
+            # 4) 绑定成功：原子切换到新监听与新配置（本段无 await，accept
+            #    回调不会插进来读到新旧混杂状态），再关闭原监听
+            self.server = new_server
+            self.cfg = dataclasses.replace(new_cfg)
+            self.listen_error = None
+            if old_server is not None:
+                old_server.close()
+                await old_server.wait_closed()
+            return ApplyResult(ok=True, listening=True, restarted=True)
 
     def _on_client(self, reader, writer):
         cfg = dataclasses.replace(self.cfg)  # 建立时快照配置

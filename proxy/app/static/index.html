@@ -35,7 +35,8 @@ pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-w
   <div><label>上行延迟 (ms)</label><input id="up_delay_ms" type="number" min="0" style="width:110px"> <span class="muted">客户端 → 目标</span></div>
   <div><label>下行延迟 (ms)</label><input id="down_delay_ms" type="number" min="0" style="width:110px"> <span class="muted">目标 → 客户端</span></div>
   <div style="margin-top:8px"><button id="saveBtn">保存配置</button> <span id="cfgStatus"></span></div>
-  <div class="muted" style="margin-top:6px">每条连接沿用建立时的配置，新配置只影响之后建立的连接；修改监听地址/端口会重启监听器（已有连接不受影响）。</div>
+  <div style="margin-top:6px">当前状态：<span id="listenState">…</span></div>
+  <div class="muted" style="margin-top:6px">每条连接沿用建立时的配置，新配置只影响之后建立的连接；修改监听地址/端口会切换监听器（已有连接不受影响，继续用旧快照完成回执）。新地址绑定失败时保留原监听与原配置并明确报错；仅当恢复也失败时才停服，保存有效配置即可恢复。</div>
 </div>
 
 <div class="card">
@@ -66,9 +67,19 @@ async function loadConfig() {
   const c = d.config;
   for (const k of ["listen_host","listen_port","target_host","target_port","up_delay_ms","down_delay_ms"])
     $(k).value = c[k];
-  $("cfgStatus").innerHTML = d.listening
-    ? `<span class="ok">● 监听中 ${esc(c.listen_host)}:${c.listen_port} → ${esc(c.target_host)}:${c.target_port}</span>`
-    : `<span class="err">● 未监听：${esc(d.listen_error || "未启动")}</span>`;
+  refreshStatus();
+}
+
+async function refreshStatus() {
+  try {
+    const r = await fetch("/api/config");
+    const d = await r.json();
+    const c = d.config;
+    $("listenState").innerHTML = d.listening
+      ? `<span class="ok">● 监听中 ${esc(c.listen_host)}:${c.listen_port} → ${esc(c.target_host)}:${c.target_port}` +
+        `（上/下行延迟 ${c.up_delay_ms}/${c.down_delay_ms} ms）</span>`
+      : `<span class="err">● 服务已停止（未监听）：${esc(d.listen_error || "未启动")}；保存有效配置可恢复</span>`;
+  } catch (e) { /* 下次刷新重试 */ }
 }
 
 async function saveConfig() {
@@ -83,13 +94,21 @@ async function saveConfig() {
   $("cfgStatus").textContent = "保存中…";
   try {
     const r = await fetch("/api/config", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
-    const d = await r.json();
-    if (!r.ok) throw new Error(JSON.stringify(d));
-    $("cfgStatus").innerHTML = d.listening
-      ? `<span class="ok">已保存，监听中 ${esc(d.config.listen_host)}:${d.config.listen_port} → ${esc(d.config.target_host)}:${d.config.target_port}</span>`
-      : `<span class="err">已保存，但监听失败：${esc(d.listen_error)}</span>`;
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.ok) {
+      const c = d.config;
+      $("cfgStatus").innerHTML = `<span class="ok">已保存并生效：${esc(c.listen_host)}:${c.listen_port} → ${esc(c.target_host)}:${c.target_port}</span>`;
+    } else {
+      // 绑定失败：后端返回非 2xx + ok=false + error，即使原监听仍在工作也明确报错
+      const msg = d.error
+        || (d.detail ? (typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail)) : null)
+        || ("HTTP " + r.status);
+      $("cfgStatus").innerHTML = `<span class="err">保存失败：${esc(msg)}</span>`;
+    }
   } catch (e) {
     $("cfgStatus").innerHTML = `<span class="err">保存失败：${esc(e.message)}</span>`;
+  } finally {
+    refreshStatus();
   }
 }
 
@@ -136,8 +155,8 @@ async function doUpload() {
     el.style.display = "block";
     el.textContent = JSON.stringify(d, null, 2);
     $("upStatus").innerHTML = d.ok
-      ? `<span class="ok">完成：${fmtNum(d.bytes_sent)} 字节，${d.duration_ms} ms，回执：${esc(d.receipt || "")}</span>`
-      : `<span class="err">失败：${esc(d.error || ("HTTP " + r.status))}</span>`;
+      ? `<span class="ok">完成：${fmtNum(d.bytes_sent)} 字节，${d.duration_ms} ms，经 ${esc(d.via || "?")}，回执：${esc(d.receipt || "")}</span>`
+      : `<span class="err">失败：${esc(d.error || ("HTTP " + r.status))}${d.via ? `（经 ${esc(d.via)}）` : ""}</span>`;
   } catch (e) {
     $("upStatus").innerHTML = `<span class="err">请求失败：${esc(e.message)}</span>`;
   } finally {
@@ -157,6 +176,7 @@ $("clearBtn").onclick = clearHistory;
 loadConfig();
 refresh();
 setInterval(refresh, 1000);
+setInterval(refreshStatus, 2000);
 </script>
 </body>
 </html>
